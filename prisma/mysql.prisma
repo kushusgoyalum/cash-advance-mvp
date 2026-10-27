@@ -1,0 +1,419 @@
+// MySQL is the system of record for everything transactional or money-related.
+// Conventions: amounts are integer PAISE (BigInt); `publicId` (ULID) is the only id
+// exposed over APIs; history/ledger/audit tables are append-only (no UPDATE/DELETE).
+
+generator mysql_client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/mysql-client"
+}
+
+datasource mysql {
+  provider = "mysql"
+  url      = env("MYSQL_DATABASE_URL")
+}
+
+enum AdvanceStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  DISBURSEMENT_PENDING
+  DISBURSEMENT_FAILED
+  DISBURSED
+  PARTIALLY_REPAID
+  OVERDUE
+  REPAID
+  CANCELLED
+  EXPIRED
+}
+
+enum ActorType {
+  USER
+  OPS
+  SYSTEM
+}
+
+enum DecisionSource {
+  AUTO
+  MANUAL
+}
+
+/// The single aggregate for the whole lifecycle: application (DRAFT..REJECTED) and
+/// advance (DISBURSED..REPAID). Every status change goes through the state machine
+/// (conditional UPDATE on status + version) — see src/modules/application/stateMachine.ts.
+///
+/// `activeUserId` is a STORED GENERATED column (= user_id while the advance is not in a
+/// terminal state, else NULL) with a UNIQUE index, so the database itself guarantees
+/// "one active advance per user". Prisma cannot express generated columns, so it is
+/// created by prisma/sql/001_generated_columns.sql and is never written by the app.
+model CashAdvance {
+  id                   BigInt          @id @default(autoincrement())
+  publicId             String          @unique @map("public_id") @mysql.Char(26)
+  userId               BigInt          @map("user_id")
+  status               AdvanceStatus   @default(DRAFT)
+  principalPaise       BigInt          @map("principal_paise")
+  feePaise             BigInt          @map("fee_paise")
+  totalRepayablePaise  BigInt          @map("total_repayable_paise")
+  collectedPaise       BigInt          @default(0) @map("collected_paise")
+  feeCollectedPaise    BigInt          @default(0) @map("fee_collected_paise")
+  tenureDays           Int             @map("tenure_days")
+  /// Indicative at DRAFT; fixed at disbursal (= disbursal date + tenure) so a slow
+  /// payout never shortens the user's tenure.
+  dueDate              DateTime?       @map("due_date") @mysql.Date
+  aprBps               Int             @map("apr_bps")
+  tier                 String          @mysql.VarChar(20)
+  snapshotId           BigInt          @map("snapshot_id")
+  productConfigVersion Int             @map("product_config_version")
+  lenderCode           String          @map("lender_code") @mysql.VarChar(30)
+  breEvaluationRef     String?         @map("bre_evaluation_ref") @mysql.VarChar(40)
+  ruleSetVersion       String?         @map("rule_set_version") @mysql.VarChar(20)
+  decisionSource       DecisionSource? @map("decision_source")
+  rejectionCode        String?         @map("rejection_code") @mysql.VarChar(50)
+  consents             Json?
+  draftExpiresAt       DateTime        @map("draft_expires_at")
+  disbursedAt          DateTime?       @map("disbursed_at")
+  closedAt             DateTime?       @map("closed_at")
+  /// Set when every collection attempt of the due date was skipped because the banking
+  /// provider was down — such advances are NOT marked overdue (design §4.3).
+  collectionBlockedByOutage Boolean    @default(false) @map("collection_blocked_by_outage")
+  activeUserId         BigInt?         @unique(map: "uq_one_active_advance_per_user") @map("active_user_id")
+  version              Int             @default(1)
+  createdAt            DateTime        @default(now()) @map("created_at")
+  updatedAt            DateTime        @updatedAt @map("updated_at")
+
+  statusHistory      StatusHistory[]
+  reviewTask         ReviewTask?
+  disbursement       Disbursement?
+  collectionAttempts CollectionAttempt[]
+  ledgerEntries      LedgerEntry[]
+
+  @@index([userId, createdAt])
+  @@index([status, dueDate])
+  @@map("cash_advance")
+}
+
+/// Append-only log of every transition (written in the same tx as the transition).
+model StatusHistory {
+  id         BigInt         @id @default(autoincrement())
+  advanceId  BigInt         @map("advance_id")
+  fromStatus AdvanceStatus? @map("from_status")
+  toStatus   AdvanceStatus  @map("to_status")
+  actorType  ActorType      @map("actor_type")
+  actorId    String         @map("actor_id") @mysql.VarChar(64)
+  reason     String?        @mysql.VarChar(255)
+  requestId  String?        @map("request_id") @mysql.VarChar(64)
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  advance CashAdvance @relation(fields: [advanceId], references: [id])
+
+  @@index([advanceId, createdAt])
+  @@map("status_history")
+}
+
+model EligibilitySnapshot {
+  id              BigInt    @id @default(autoincrement())
+  userId          BigInt    @map("user_id")
+  eligible        Boolean
+  reasons         Json
+  tier            String?   @mysql.VarChar(20)
+  maxAmountPaise  BigInt    @default(0) @map("max_amount_paise")
+  eligibleFrom    DateTime? @map("eligible_from") @mysql.Date
+  ruleSetVersion  String    @map("rule_set_version") @mysql.VarChar(20)
+  validTill       DateTime  @map("valid_till")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("eligibility_snapshot")
+}
+
+/// Immutable, versioned pricing/product configuration. Advances store the version used.
+model ProductConfig {
+  version        Int      @id
+  lenderCode     String   @map("lender_code") @mysql.VarChar(30)
+  /// [{ tier, capPaise, feePaise }]
+  tiers          Json
+  tenureOptions  Json     @map("tenure_options")
+  minAmountPaise BigInt   @map("min_amount_paise")
+  maxAmountPaise BigInt   @map("max_amount_paise")
+  effectiveFrom  DateTime @map("effective_from")
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("product_config")
+}
+
+enum ReviewTaskStatus {
+  OPEN
+  CLAIMED
+  DONE
+  EXPIRED
+}
+
+model ReviewTask {
+  id        BigInt           @id @default(autoincrement())
+  advanceId BigInt           @unique @map("advance_id")
+  status    ReviewTaskStatus @default(OPEN)
+  assignee  String?          @mysql.VarChar(64)
+  slaDueAt  DateTime         @map("sla_due_at")
+  decision  String?          @mysql.VarChar(20)
+  note      String?          @mysql.VarChar(500)
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  advance CashAdvance @relation(fields: [advanceId], references: [id])
+
+  @@index([status, slaDueAt])
+  @@map("review_task")
+}
+
+enum PayoutStatus {
+  INITIATED
+  PENDING
+  SUCCESS
+  FAILED
+  UNKNOWN
+}
+
+/// One row per advance (UNIQUE advance_id). `clientRef` = DSB-{advanceId}-{payoutAttempt}
+/// is sent to the bank as the idempotency key; `payoutAttempt` is incremented ONLY after
+/// the bank has confirmed the previous attempt failed.
+model Disbursement {
+  id            BigInt       @id @default(autoincrement())
+  advanceId     BigInt       @unique @map("advance_id")
+  clientRef     String       @unique @map("client_ref") @mysql.VarChar(64)
+  payoutAttempt Int          @default(1) @map("payout_attempt")
+  amountPaise   BigInt       @map("amount_paise")
+  status        PayoutStatus @default(INITIATED)
+  providerRef   String?      @map("provider_ref") @mysql.VarChar(64)
+  utr           String?      @mysql.VarChar(40)
+  retryCount    Int          @default(0) @map("retry_count")
+  lastError     String?      @map("last_error") @mysql.VarChar(255)
+  nextRetryAt   DateTime?    @map("next_retry_at")
+  firstTriedAt  DateTime?    @map("first_tried_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  advance CashAdvance @relation(fields: [advanceId], references: [id])
+
+  @@index([status, nextRetryAt])
+  @@map("disbursement")
+}
+
+enum CollectionChannel {
+  ACCOUNT_DEBIT
+  MANDATE
+  USER_INITIATED
+}
+
+enum CollectionStatus {
+  PLANNED
+  IN_PROGRESS
+  SUCCESS
+  PARTIAL
+  NO_FUNDS
+  FAILED
+  SKIPPED_OUTAGE
+}
+
+/// One row per planned debit. UNIQUE(advance_id, attempt_seq) makes the planner
+/// idempotent; `clientRef` = COL-{advanceId}-{attemptSeq} is the bank idempotency key.
+model CollectionAttempt {
+  id             BigInt            @id @default(autoincrement())
+  advanceId      BigInt            @map("advance_id")
+  attemptSeq     Int               @map("attempt_seq")
+  scheduledFor   DateTime          @map("scheduled_for")
+  channel        CollectionChannel @default(ACCOUNT_DEBIT)
+  clientRef      String            @unique @map("client_ref") @mysql.VarChar(64)
+  requestedPaise BigInt            @default(0) @map("requested_paise")
+  collectedPaise BigInt            @default(0) @map("collected_paise")
+  status         CollectionStatus  @default(PLANNED)
+  providerRef    String?           @map("provider_ref") @mysql.VarChar(64)
+  failureReason  String?           @map("failure_reason") @mysql.VarChar(255)
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  advance CashAdvance @relation(fields: [advanceId], references: [id])
+
+  @@unique([advanceId, attemptSeq], map: "uq_attempt_per_advance")
+  @@index([status, scheduledFor])
+  @@map("collection_attempt")
+}
+
+enum LedgerEntryType {
+  DISBURSAL
+  FEE
+  REPAY_FEE
+  REPAY_PRINCIPAL
+  REVERSAL
+}
+
+enum LedgerDirection {
+  DR
+  CR
+}
+
+/// Append-only double entry. Every money movement writes a balanced DR/CR pair that
+/// shares one `reference` (e.g. DSB-12-1, COL-12-3:FEE).
+model LedgerEntry {
+  id          BigInt          @id @default(autoincrement())
+  advanceId   BigInt          @map("advance_id")
+  entryType   LedgerEntryType @map("entry_type")
+  account     String          @mysql.VarChar(40)
+  direction   LedgerDirection
+  amountPaise BigInt          @map("amount_paise")
+  reference   String          @mysql.VarChar(64)
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  advance CashAdvance @relation(fields: [advanceId], references: [id])
+
+  @@unique([reference, account, direction], map: "uq_ledger_ref_account_dir")
+  @@index([advanceId])
+  @@map("ledger_entry")
+}
+
+enum MandateStatus {
+  PENDING
+  ACTIVE
+  REVOKED
+  FAILED
+}
+
+/// Phase 2 (only if mandates are adopted — open question Q10).
+model Mandate {
+  id             BigInt        @id @default(autoincrement())
+  userId         BigInt        @map("user_id")
+  type           String        @mysql.VarChar(20)
+  umrn           String?       @unique @mysql.VarChar(40)
+  maxAmountPaise BigInt        @map("max_amount_paise")
+  status         MandateStatus @default(PENDING)
+  providerRef    String?       @map("provider_ref") @mysql.VarChar(64)
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@map("mandate")
+}
+
+enum NotificationChannel {
+  PUSH
+  SMS
+  WHATSAPP
+  EMAIL
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id            BigInt              @id @default(autoincrement())
+  userId        BigInt              @map("user_id")
+  advanceId     BigInt?             @map("advance_id")
+  eventType     String              @map("event_type") @mysql.VarChar(50)
+  channel       NotificationChannel
+  templateId    String              @map("template_id") @mysql.VarChar(64)
+  /// Template variables, kept so retries/fallbacks can re-render without the original event.
+  variables     Json?
+  /// event:advance:channel[:seq] — UNIQUE, so a redelivered event never re-sends.
+  dedupeKey     String              @unique @map("dedupe_key") @mysql.VarChar(160)
+  status        NotificationStatus  @default(PENDING)
+  attempts      Int                 @default(0)
+  providerMsgId String?             @map("provider_msg_id") @mysql.VarChar(80)
+  lastError     String?             @map("last_error") @mysql.VarChar(255)
+  createdAt     DateTime            @default(now()) @map("created_at")
+  updatedAt     DateTime            @updatedAt @map("updated_at")
+
+  @@index([advanceId])
+  @@map("notification")
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  DONE
+}
+
+model IdempotencyKey {
+  userId       String            @map("user_id") @mysql.VarChar(64)
+  key          String            @mysql.VarChar(64)
+  endpoint     String            @mysql.VarChar(120)
+  requestHash  String            @map("request_hash") @mysql.Char(64)
+  status       IdempotencyStatus @default(IN_PROGRESS)
+  responseCode Int?              @map("response_code")
+  responseBody Json?             @map("response_body")
+  expiresAt    DateTime          @map("expires_at")
+  createdAt    DateTime          @default(now()) @map("created_at")
+
+  @@id([userId, key])
+  @@index([expiresAt])
+  @@map("idempotency_key")
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+/// Transactional outbox: written in the SAME transaction as the state change, then
+/// published to SQS by the relay. Consumers are idempotent (at-least-once delivery).
+model OutboxEvent {
+  id            BigInt       @id @default(autoincrement())
+  aggregateType String       @map("aggregate_type") @mysql.VarChar(40)
+  aggregateId   String       @map("aggregate_id") @mysql.VarChar(64)
+  eventType     String       @map("event_type") @mysql.VarChar(60)
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  createdAt     DateTime     @default(now()) @map("created_at")
+  publishedAt   DateTime?    @map("published_at")
+
+  @@index([status, id])
+  @@map("outbox_event")
+}
+
+/// Immutable audit trail. App DB role has INSERT + SELECT only (prisma/sql/002_grants.sql).
+/// Per-entity hash chain: hash = SHA-256(prevHash || canonical(record)).
+model AuditLog {
+  id         BigInt    @id @default(autoincrement())
+  entityType String    @map("entity_type") @mysql.VarChar(40)
+  entityId   String    @map("entity_id") @mysql.VarChar(64)
+  action     String    @mysql.VarChar(60)
+  actorType  ActorType @map("actor_type")
+  actorId    String    @map("actor_id") @mysql.VarChar(64)
+  before     Json?
+  after      Json?
+  reason     String?   @mysql.VarChar(500)
+  ip         String?   @mysql.VarChar(45)
+  requestId  String?   @map("request_id") @mysql.VarChar(64)
+  prevHash   String?   @map("prev_hash") @mysql.Char(64)
+  hash       String    @mysql.Char(64)
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([entityType, entityId, id])
+  @@map("audit_log")
+}
+
+/// Makes scheduled jobs idempotent per business date (a double cron trigger is harmless).
+model JobRun {
+  id           BigInt    @id @default(autoincrement())
+  job          String    @mysql.VarChar(60)
+  businessDate String    @map("business_date") @mysql.Char(10)
+  status       String    @default("RUNNING") @mysql.VarChar(20)
+  stats        Json?
+  startedAt    DateTime  @default(now()) @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+
+  @@unique([job, businessDate], map: "uq_job_per_business_date")
+  @@map("job_run")
+}
+
+/// Consumer-side dedupe for SQS (at-least-once) — `messageKey` = eventId:consumer.
+model ProcessedMessage {
+  messageKey  String   @id @map("message_key") @mysql.VarChar(120)
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@map("processed_message")
+}

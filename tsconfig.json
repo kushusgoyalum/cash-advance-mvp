@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": ["ES2022"],
+    "moduleResolution": "bundler",
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "types": ["node"],
+    "paths": {
+      "@modules": ["./src/modules"],
+      "@modules/*": ["./src/modules/*"],
+      "@database": ["./src/modules/database"],
+      "@database/*": ["./src/modules/database/*"],
+      "@common": ["./src/modules/shared"],
+      "@common/*": ["./src/modules/shared/*"],
+      "@routes/*": ["./src/routes/*"],
+      "@prisma/mysql-client": ["./node_modules/.prisma/mysql-client"],
+      "@prisma/mongodb-client": ["./node_modules/.prisma/mongodb-client"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,17 @@
+# Local dependencies only (the app runs on the host with `pnpm dev` / `pnpm dev:worker`).
+services:
+  mysql:
+    image: mysql:8.0.39
+    environment: { MYSQL_ROOT_PASSWORD: root, MYSQL_DATABASE: cash_advance_db }
+    ports: ['3306:3306']
+  mongo:
+    image: mongo:7.0.14
+    command: ['--replSet', 'rs0', '--bind_ip_all']
+    ports: ['27017:27017']
+  redis:
+    image: redis:7.4.1
+    ports: ['6379:6379']
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment: { SERVICES: sqs }
+    ports: ['4566:4566']

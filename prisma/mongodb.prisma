@@ -1,0 +1,91 @@
+// MongoDB holds semi-structured, append-heavy data that is not part of the money path.
+
+generator mongodb_client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/mongodb-client"
+}
+
+datasource mongodb {
+  provider = "mongodb"
+  url      = env("MONGODB_URL")
+}
+
+/// Full decision trace of a BRE run (facts, rule results, outcome) — referenced from
+/// cash_advance.bre_evaluation_ref so ops can see exactly why a decision was made.
+model BreEvaluation {
+  id             String   @id @default(auto()) @map("_id") @mongodb.ObjectId
+  userId         String   @map("user_id")
+  advanceId      String?  @map("advance_id")
+  stage          String
+  ruleSetVersion String   @map("rule_set_version")
+  facts          Json
+  ruleResults    Json     @map("rule_results")
+  decision       String
+  tier           String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("bre_evaluations")
+}
+
+/// Bureau hard-pull reports (restricted access). Reused for up to 30 days.
+model BureauReport {
+  id         String   @id @default(auto()) @map("_id") @mongodb.ObjectId
+  userId     String   @map("user_id")
+  bureau     String
+  consentRef String   @map("consent_ref")
+  summary    Json
+  raw        Json?
+  pulledAt   DateTime @default(now()) @map("pulled_at")
+
+  @@index([userId, pulledAt])
+  @@map("bureau_reports")
+}
+
+/// Masked request/response log of every provider call (bank, bureau, Karix).
+model ProviderApiLog {
+  id         String   @id @default(auto()) @map("_id") @mongodb.ObjectId
+  provider   String
+  operation  String
+  clientRef  String?  @map("client_ref")
+  request    Json?
+  response   Json?
+  httpStatus Int?     @map("http_status")
+  latencyMs  Int?     @map("latency_ms")
+  error      String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([provider, clientRef])
+  @@map("provider_api_logs")
+}
+
+/// Durable inbox for provider webhooks. UNIQUE(providerEventId) dedupes duplicates.
+model WebhookInbox {
+  id              String    @id @default(auto()) @map("_id") @mongodb.ObjectId
+  provider        String
+  providerEventId String    @unique @map("provider_event_id")
+  eventType       String    @map("event_type")
+  payload         Json
+  status          String    @default("RECEIVED")
+  attempts        Int       @default(0)
+  failureReason   String?   @map("failure_reason")
+  receivedAt      DateTime  @default(now()) @map("received_at")
+  processedAt     DateTime? @map("processed_at")
+
+  @@index([status, receivedAt])
+  @@map("webhook_inbox")
+}
+
+/// Daily reconciliation result (matched / provider-only / ours-only buckets).
+model ReconReport {
+  id           String   @id @default(auto()) @map("_id") @mongodb.ObjectId
+  businessDate String   @map("business_date")
+  account      String
+  matched      Int
+  providerOnly Json     @map("provider_only")
+  oursOnly     Json     @map("ours_only")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@unique([businessDate, account])
+  @@map("recon_reports")
+}
